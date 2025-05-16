@@ -29,6 +29,7 @@ import org.bukkit.event.entity.EntityExplodeEvent
 import org.bukkit.event.entity.EntityInteractEvent
 import org.bukkit.event.player.PlayerBucketEmptyEvent
 import org.bukkit.event.player.PlayerInteractEvent
+import org.bukkit.event.player.PlayerInteractEntityEvent
 import phonon.nodes.Config
 import phonon.nodes.Message
 import phonon.nodes.Nodes
@@ -39,6 +40,16 @@ import phonon.nodes.objects.TerritoryChunk
 import phonon.nodes.objects.Town
 import phonon.nodes.war.FlagWar
 import phonon.nodes.war.Attack
+import org.bukkit.entity.Animals
+
+// Set of common vanilla breeding items
+private val BREEDING_ITEMS = setOf(
+    Material.WHEAT, Material.WHEAT_SEEDS, Material.CARROT, Material.POTATO, Material.BEETROOT, Material.BEETROOT_SEEDS,
+    Material.PUMPKIN_SEEDS, Material.MELON_SEEDS, Material.BREAD, Material.GOLDEN_CARROT, Material.GOLDEN_APPLE,
+    Material.TROPICAL_FISH, Material.SALMON, Material.COD, Material.PUFFERFISH, // Note: Needs specific checks for pandas/dolphins/axolotl, but good general start
+    Material.HAY_BLOCK, Material.DANDELION, Material.POPPY, // etc. - add more as needed
+    Material.BAMBOO, Material.CACTUS, Material.SUGAR_CANE, Material.KELP // For specific animals
+)
 
 public class NodesWorldListener: Listener {
 
@@ -58,9 +69,26 @@ public class NodesWorldListener: Listener {
             }
 
             if ( attack !== null ) {
+                // ---> START ARMOR CHECK
+                val armor = player.inventory.armorContents
+                var armorPieces = 0
+                for (piece in armor) {
+                    if (piece != null && piece.type != Material.AIR) {
+                        armorPieces++
+                    }
+                }
+
+                if (armorPieces < 3) {
+                    event.setCancelled(true)
+                    Message.error(player, "${ChatColor.RED}[War] You need at least 3 armor pieces equipped to break a war flag!")
+                    return // Exit early if not enough armor
+                }
+                // ---> END ARMOR CHECK
+                
                 event.setCancelled(true)
                 attack.cancel()
                 Message.broadcast("${ChatColor.GOLD}[War] Attack at (${block.x}, ${block.y}, ${block.z}) defeated by ${player.name}")
+                return 
             }
         }
         
@@ -146,15 +174,15 @@ public class NodesWorldListener: Listener {
                 if ( territoryChunk.attacker !== null ) {
                     // op bypass
                     if ( player.isOp() ) {
-                        return
-                    }
-
-                    var attack = FlagWar.chunkToAttacker.get(territoryChunk.coord)
-                    if ( attack !== null ) {
-                        if ( blockInWarFlagNoBuildRegion(block, attack) ) {
-                            event.setCancelled(true)
-                            Message.error(player, "[War] Cannot build within ${Config.flagNoBuildDistance} blocks of war flags")
-                            return
+                        // Don't return here, proceed to permission checks below
+                    } else { // Check non-ops trying to build near flags
+                        var attack = FlagWar.chunkToAttacker.get(territoryChunk.coord)
+                        if ( attack !== null ) {
+                            if ( blockInWarFlagNoBuildRegion(block, attack) ) {
+                                event.setCancelled(true)
+                                Message.error(player, "[War] Cannot build within ${Config.flagNoBuildDistance} blocks of war flags")
+                                return
+                            }
                         }
                     }
                 }
@@ -165,6 +193,22 @@ public class NodesWorldListener: Listener {
                     if ( resident !== null ) {
                         val town = resident.town
                         if ( town !== null ) {
+                            // ---> START ARMOR CHECK
+                            val armor = player.inventory.armorContents
+                            var armorPieces = 0
+                            for (piece in armor) {
+                                if (piece != null && piece.type != Material.AIR) {
+                                    armorPieces++
+                                }
+                            }
+
+                            if (armorPieces < 3 && !player.isOp()) { // Added OP bypass for placing flags
+                                event.setCancelled(true)
+                                Message.error(player, "${ChatColor.RED}[War] You need at least 3 armor pieces equipped to place a war flag!")
+                                return // Exit early if not enough armor
+                            }
+                            // ---> END ARMOR CHECK
+
                             val result = FlagWar.beginAttack(player.getUniqueId(), town, territoryChunk, block)
                             if ( result.isSuccess ) {
                                 // get town being attacked
@@ -193,31 +237,37 @@ public class NodesWorldListener: Listener {
                                     ErrorTooManyAttacks -> Message.error(player, "[War] You cannot attack any more chunks at the same time")
                                 }
                     
-                                // cancel event
+                                // cancel event on failure (except for armor check which cancels above)
                                 event.setCancelled(true)
                             }
                         }
-                        else {
-                            Message.error(player, "[War] Cannot claim unless you are part of a town")
-                            event.setCancelled(true)
+                        else { // Resident has no town
+                           event.setCancelled(true) // Prevent placing flag if no town
+                           Message.error(player, "You must belong to a town to place a war flag.")
+                           // Skip permission checks below if resident has no town
+                           return 
                         }
-                    } else {
-                        event.setCancelled(true)
+                    } else { // Not a resident
+                       event.setCancelled(true) // Prevent placing flag if not a resident
+                       Message.error(player, "You must be a registered resident to place a war flag.")
+                       // Skip permission checks below if not a resident
+                       return
                     }
                 }
-            }
-        }
+            } // End territoryChunk != null check
+        } // End war enabled check
 
-        // op bypass
+        // General block placement permissions (runs if not placing a flag or if OP places a flag)
+
+        // op bypass for general placement
         if ( player.isOp() ) {
             return
         }
-        
+
         val territory: Territory? = Nodes.getTerritoryFromChunk(block.chunk)
-        val territoryChunk = Nodes.getTerritoryChunkFromBlock(block.x, block.z)
-        val resident = Nodes.getResident(player)
         val town: Town? = territory?.town
-        
+        val resident = Nodes.getResident(player)
+
         // interacting in areas with no territory or no town
         if ( town === null ) {
             if ( hasWildernessPermissions(territory) ) {
@@ -241,13 +291,9 @@ public class NodesWorldListener: Listener {
                 return
             }
 
-            // war permissions
-            if ( hasWarPermissions(resident, territory, territoryChunk!!) ) {
-                return
-            }
-
-            // ignore if war enabled and item in hand is a flag material
-            if ( Nodes.war.enabled && Config.flagMaterials.contains(block.type) ) {
+            // war permissions (redundant for flag placement, checked above, but keep for general building)
+            val territoryChunk = Nodes.getTerritoryChunkFromBlock(block.x, block.z) // Recalculate if needed
+            if ( territoryChunk !== null && hasWarPermissions(resident, territory, territoryChunk) ) {
                 return
             }
         }
@@ -648,6 +694,36 @@ public class NodesWorldListener: Listener {
                 }
             }
         }
+    }
+
+    /**
+     * Always allow players to attempt to feed animals for breeding,
+     * regardless of territory permissions.
+     */
+    @EventHandler(priority = EventPriority.LOW) // Low priority to run early and prevent cancellation by later permission checks if possible
+    public fun onPlayerFeedAnimalAttempt(event: PlayerInteractEntityEvent) {
+        val player = event.player
+        val entity = event.rightClicked
+
+        // Check if the player is interacting with an animal
+        if (entity is Animals) {
+            // Check if the player is holding a potential breeding item in their main hand
+            val itemInHand = player.inventory.itemInMainHand
+            if (itemInHand != null && BREEDING_ITEMS.contains(itemInHand.type)) {
+                // If it looks like a breeding attempt, do nothing and let vanilla handle it.
+                // Explicitly DON'T check nodes permissions here.
+                return
+            }
+            // Also check off-hand, just in case
+             val itemInOffHand = player.inventory.itemInOffHand
+             if (itemInOffHand != null && BREEDING_ITEMS.contains(itemInOffHand.type) && event.hand == org.bukkit.inventory.EquipmentSlot.OFF_HAND) {
+                 // If using off-hand with breeding item, also allow.
+                 return
+             }
+        }
+
+        // If it wasn't an animal or wasn't a potential breeding item,
+        // let other listeners or default behavior handle the interaction.
     }
 }
 

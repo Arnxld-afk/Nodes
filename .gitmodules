@@ -1,0 +1,3 @@
+[submodule "znodes-dynmap"]
+	path = znodes-dynmap
+	url = https://github.com/tlm9201/znodes-dynmap.git

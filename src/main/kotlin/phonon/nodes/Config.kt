@@ -265,7 +265,7 @@ public object Config {
     public var restrictExplosions: Boolean = true
     public var onlyAllowExplosionsDuringWar: Boolean = true
 
-    public var flagMaterialDefault: Material = Material.OAK_FENCE
+    public var flagMaterialDefault: Material = Material.COBBLED_DEEPSLATE
     
     public var flagMaterials: EnumSet<Material> = EnumSet.of(
         Material.ACACIA_FENCE,
@@ -273,7 +273,14 @@ public object Config {
         Material.DARK_OAK_FENCE,
         Material.JUNGLE_FENCE,
         Material.OAK_FENCE,
-        Material.SPRUCE_FENCE
+        Material.SPRUCE_FENCE,
+        // Deepslate options - ensure the default is here if it's not a fence
+        Material.COBBLED_DEEPSLATE_WALL,
+        Material.POLISHED_DEEPSLATE_WALL,
+        Material.DEEPSLATE_BRICK_WALL,
+        Material.DEEPSLATE_TILE_WALL,
+        Material.COBBLED_DEEPSLATE_WALL,
+        Material.POLISHED_DEEPSLATE_WALL
         // Material.FENCE, // 1.12 only
     )
 
@@ -356,6 +363,8 @@ public object Config {
     // 72 hour = 259200000 ms
     public var trucePeriod: Long = 172800000L
 
+    // Flag beacon render distance
+    public var flagBeaconViewDistance: Double = 64.0 // Default value
     
     // ===================================================
     // Load config

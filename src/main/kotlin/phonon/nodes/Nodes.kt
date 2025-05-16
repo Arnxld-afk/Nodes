@@ -23,6 +23,7 @@ import phonon.nodes.event.AllianceCreatedEvent
 import phonon.nodes.event.TruceExpiredEvent
 import phonon.nodes.listeners.NodesPlayerChestProtectListener
 import phonon.nodes.objects.*
+// import kotlinx.serialization.json.Json
 import phonon.nodes.serdes.Deserializer
 import phonon.nodes.serdes.Serializer
 import phonon.nodes.tasks.FileWriteTask
@@ -45,6 +46,10 @@ import java.util.concurrent.Future
 import java.util.concurrent.ThreadLocalRandom
 import java.util.logging.Logger
 import kotlin.system.measureNanoTime
+import java.util.concurrent.TimeUnit
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask // Paper scheduler
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
 
 // backup format
 private val BACKUP_DATE_FORMATTER = SimpleDateFormat("yyyy.MM.dd.HH.mm.ss"); 
@@ -3225,7 +3230,7 @@ public object Nodes {
 
         val protectedBlocks = town.protectedBlocks
 
-        val particle = Particle.VILLAGER_HAPPY
+        val particle = Particle.HAPPY_VILLAGER
         val particleCount = 3
         val randomOffsetXZ = 0.05
         val randomOffsetY = 0.1
@@ -3318,5 +3323,45 @@ public object Nodes {
         } catch (e: ClassNotFoundException) {
             return false
         }
+    }
+
+    // Added properties for Dynmap War Flag updates
+    private var dynmapWarFlagUpdateTask: ScheduledTask? = null
+    private val json = Json { 
+        prettyPrint = true
+        ignoreUnknownKeys = true 
+    } // Configure Json instance
+
+    // Add these functions to your Nodes class:
+    fun enableDynmapWarFlagUpdates() {
+        if (!war.enabled) { // Optional: only run if war is enabled
+            logger?.info("[Nodes-Dynmap] War is not enabled, Dynmap war flag updates will not start.")
+            return
+        }
+        if (dynmapWarFlagUpdateTask != null) {
+            dynmapWarFlagUpdateTask?.cancel()
+        }
+
+        val warFlagsFile = File(plugin!!.dataFolder, "dynmap_export/nodes/warflags.json")
+        logger?.info("[Nodes-Dynmap] Starting Dynmap war flag updates. Outputting to: ${warFlagsFile.absolutePath}")
+
+        dynmapWarFlagUpdateTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin!!, { task ->
+            try {
+                val flagsToSave = war.getActiveWarFlagsForDynmap()
+                val jsonData = json.encodeToString(flagsToSave)
+
+                warFlagsFile.parentFile.mkdirs() // Ensure parent directories exist
+                warFlagsFile.writeText(jsonData)
+            } catch (e: Exception) {
+                logger?.warning("[Nodes-Dynmap] Error updating warflags.json: ${e.message}")
+                e.printStackTrace() // For detailed debugging during development
+            }
+        }, 0L, 5L, TimeUnit.SECONDS) // Update every 5 seconds (adjust interval as needed)
+    }
+
+    fun disableDynmapWarFlagUpdates() {
+        dynmapWarFlagUpdateTask?.cancel()
+        dynmapWarFlagUpdateTask = null
+        logger?.info("[Nodes-Dynmap] Stopped Dynmap war flag updates.")
     }
 }

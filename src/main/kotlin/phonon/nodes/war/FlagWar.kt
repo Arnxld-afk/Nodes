@@ -24,32 +24,33 @@
 package phonon.nodes.war
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask
-import java.util.EnumSet
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import java.nio.file.Files
-import kotlin.system.measureNanoTime
-import org.bukkit.Bukkit
-import org.bukkit.World
-import org.bukkit.ChatColor
-import org.bukkit.plugin.java.JavaPlugin
-import org.bukkit.boss.*
-import org.bukkit.entity.Player
-import org.bukkit.Material
+import org.bukkit.*
 import org.bukkit.block.Block
-import org.bukkit.event.Listener
-import org.bukkit.scheduler.BukkitTask
+import org.bukkit.block.data.BlockData
+import org.bukkit.boss.BarColor
+import org.bukkit.boss.BarStyle
 import org.bukkit.command.CommandSender
-import phonon.nodes.Nodes
-import phonon.nodes.Message
+import org.bukkit.entity.ArmorStand
+import org.bukkit.entity.Player
+import org.bukkit.plugin.java.JavaPlugin
 import phonon.nodes.Config
+import phonon.nodes.Message
+import phonon.nodes.Nodes
+import phonon.nodes.constants.*
+import phonon.nodes.event.WarAttackCancelEvent
+import phonon.nodes.event.WarAttackFinishEvent
+import phonon.nodes.event.WarAttackStartEvent
 import phonon.nodes.objects.Coord
 import phonon.nodes.objects.Territory
 import phonon.nodes.objects.TerritoryChunk
 import phonon.nodes.objects.Town
-import phonon.nodes.event.*
-import phonon.nodes.constants.*
+import java.nio.file.Files
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
 
 //import phonon.blockedit.FastBlockEditSession
 
@@ -69,54 +70,44 @@ private val WOOL_COLORS: Array<Byte> = arrayOf(
     4    // yellow        [0.9, 1.0]
 )
 
-// 1.16 direct material refs
+// New Deepslate progression for FLAG_COLORS
 private val FLAG_COLORS: Array<Material> = arrayOf(
-    Material.BLACK_WOOL,      // [0.0, 0.1]
-    Material.GRAY_WOOL,       // [0.1, 0.2]
-    Material.LIGHT_GRAY_WOOL, // [0.2, 0.3]
-    Material.BLUE_WOOL,       // [0.3, 0.4]
-    Material.PURPLE_WOOL,     // [0.4, 0.5]
-    Material.MAGENTA_WOOL,    // [0.5, 0.6]
-    Material.PINK_WOOL,       // [0.6, 0.7]
-    Material.RED_WOOL,        // [0.7, 0.8]
-    Material.ORANGE_WOOL,     // [0.8, 0.9]
-    Material.YELLOW_WOOL      // [0.9, 1.0]
+    Material.COBBLED_DEEPSLATE,      // [0.0, 0.1]
+    Material.DEEPSLATE_BRICKS,       // [0.1, 0.2]
+    Material.DEEPSLATE_TILES,        // [0.2, 0.3]
+    Material.POLISHED_DEEPSLATE,     // [0.3, 0.4]
+    Material.CHISELED_DEEPSLATE,     // [0.8, 0.9]
+    Material.CRACKED_DEEPSLATE_BRICKS // [0.9, 1.0] - Final state
 )
 
 // private val BEACON_COLOR_BLOCK = Material.WOOL     // 1.12 only
 // private val BEACON_EDGE_BLOCK = Material.GLOWSTONE // 1.12 use glowstone
 private val SKY_BEACON_FRAME_BLOCK = Material.MAGMA_BLOCK // 1.16 use magma
 
-// contain all flag materials for sky beacon
+// Updated SKY_BEACON_MATERIALS with Deepslate
 private val SKY_BEACON_MATERIALS: EnumSet<Material> = EnumSet.of(
-    SKY_BEACON_FRAME_BLOCK,
-    Material.BLACK_WOOL,      // flag wool stuff
-    Material.GRAY_WOOL, 
-    Material.LIGHT_GRAY_WOOL,
-    Material.BLUE_WOOL,  
-    Material.PURPLE_WOOL,
-    Material.MAGENTA_WOOL,
-    Material.PINK_WOOL, 
-    Material.RED_WOOL,  
-    Material.ORANGE_WOOL, 
-    Material.YELLOW_WOOL  
+    SKY_BEACON_FRAME_BLOCK, // Still MAGMA_BLOCK by default
+    // Add all materials from the new FLAG_COLORS array
+    Material.COBBLED_DEEPSLATE,
+    Material.DEEPSLATE_BRICKS,
+    Material.DEEPSLATE_TILES,
+    Material.POLISHED_DEEPSLATE,
+    Material.COBBLED_DEEPSLATE_WALL,
+    Material.DEEPSLATE_BRICK_WALL,
+    Material.DEEPSLATE_TILE_WALL,
+    Material.POLISHED_DEEPSLATE_WALL,
+    Material.CHISELED_DEEPSLATE,
+    Material.CRACKED_DEEPSLATE_BRICKS
 )
 
 /**
- * Set flag colored block
+ * Set flag colored block (Now sets Deepslate variant)
  * 
  * Color based on attack progress
  */
-private fun setFlagAttackColorBlock(block: Block, progress: Int) {
-    if ( progress < 0 || progress > 9 ) {
-        return
-    }
-
-    // 1.12
-    // block.setType(Material.WOOL)
-    // block.setData(WOOL_COLORS[progress])
-
-    block.setType(FLAG_COLORS[progress])
+private fun setFlagAttackColorBlock(block: Block, progressColorIndex: Int) {
+    val index = max(0, min(FLAG_COLORS.size - 1, progressColorIndex))
+    block.setType(FLAG_COLORS[index])
 }
 
 public object FlagWar {
@@ -169,6 +160,10 @@ public object FlagWar {
 
     // periodic task to check for save
     internal var saveTask: ScheduledTask? = null
+
+    // Configurable distance squared for sending block updates
+    private const val BEACON_VIEW_DISTANCE_DEFAULT = 64.0
+    private var beaconViewDistanceSquared = BEACON_VIEW_DISTANCE_DEFAULT.pow(2)
 
     public fun initialize(flagMaterials: EnumSet<Material>) {
         FlagWar.flagMaterials.addAll(flagMaterials)
@@ -263,52 +258,62 @@ public object FlagWar {
         flagBase: Block,
         progress: Long
     ) {
-        val skyBeaconColorBlocks: MutableList<Block> = mutableListOf()
-        val skyBeaconWireframeBlocks: MutableList<Block> = mutableListOf()
-
-        val progressNormalized = progress.toDouble() / Config.chunkAttackTime.toDouble()
-        val progressColor = FlagWar.getProgressColor(progressNormalized)
-
-        // recreate sky beacon
-        FlagWar.createAttackBeacon(
-            skyBeaconColorBlocks,
-            skyBeaconWireframeBlocks,
-            flagBase.world,
-            coord,
-            flagBase.y,
-            progressColor,
-            true,
-            true,
-            true
-        )
-
         // get resident and their town
         val attackerResident = Nodes.getResidentFromUUID(attacker)
-        if ( attackerResident == null ) {
+        if (attackerResident == null) {
+            Nodes.logger?.warning("[WarLoad] Could not find resident for attacker UUID: $attacker")
+            // Should we try to clean up the invalid flag blocks?
+            // flagBase.getRelative(0,1,0).setType(Material.AIR) // flagBlock
+            // flagBase.getRelative(0,2,0).setType(Material.AIR) // flagTorch
+            // flagBase.setType(Material.AIR)
             return
         }
         val attackingTown = attackerResident.town
-        if ( attackingTown == null ) {
+        if (attackingTown == null) {
+             Nodes.logger?.warning("[WarLoad] Resident ${attackerResident.name} has no town, cannot load attack at $coord.")
+            // Clean up flag blocks?
             return
         }
 
         // get territory chunk
         val chunk = Nodes.getTerritoryChunkFromCoord(coord)
-        if ( chunk == null ) {
+        if (chunk == null) {
+            Nodes.logger?.warning("[WarLoad] Could not find territory chunk at $coord, cannot load attack.")
+             // Clean up flag blocks?
             return
         }
 
-        // create attack
-        FlagWar.createAttack(
-            attacker,
-            attackingTown,
-            chunk,
-            flagBase,
-            progress,
-            skyBeaconColorBlocks,
-            skyBeaconWireframeBlocks
-        )
+        // Validate flag blocks exist before creating attack
+        val flagBlock = flagBase.getRelative(0,1,0)
+        val flagTorch = flagBase.getRelative(0,2,0)
+        if (flagBlock.type == Material.AIR || flagTorch.type == Material.AIR) {
+             Nodes.logger?.warning("[WarLoad] Flag blocks missing at ${flagBase.location}, cannot load attack.")
+             // Ensure base is also cleared if partial flag exists
+             flagBase.setType(Material.AIR)
+             return
+        }
 
+        // Call createAttack - it now handles beacon creation internally
+        // No longer pass beacon lists
+        try {
+            createAttack(
+                attacker,
+                attackingTown,
+                chunk,
+                flagBase,
+                progress // Pass initial progress
+            )
+        } catch (e: Exception) {
+            Nodes.logger?.severe("[WarLoad] Exception during createAttack for $coord: ${e.message}")
+            // Attempt cleanup
+             try {
+                flagTorch.setType(Material.AIR)
+                flagBlock.setType(Material.AIR)
+                flagBase.setType(Material.AIR)
+             } catch (cleanupEx: Exception) {
+                // Ignore cleanup exception
+             }
+        }
     }
 
     // cleanup when Nodes plugin disabled
@@ -417,7 +422,7 @@ public object FlagWar {
     //    and player can attack
     // 2. create and run attack timer thread
     internal fun beginAttack(attacker: UUID, attackingTown: Town, chunk: TerritoryChunk, flagBase: Block): Result<Attack> {
-        val world = flagBase.getWorld()
+        val world = flagBase.world
         val flagBaseX = flagBase.x
         val flagBaseY = flagBase.y
         val flagBaseZ = flagBase.z
@@ -472,13 +477,13 @@ public object FlagWar {
             }
 
             // check that there is room to create flag
-            if ( flagBaseY >= 253 ) { // need room for wool + torch
+            if ( flagBaseY >= world.maxHeight - 2 ) { // need room for wool + torch
                 return Result.failure(ErrorFlagTooHigh)
             }
 
             // check flag has vision to sky
-            for ( y in flagBaseY+1..255 ) {
-                if ( !world.getBlockAt(flagBaseX, y, flagBaseZ).isEmpty() ) {
+            for ( y in flagBaseY+1 until world.maxHeight ) {
+                if ( !world.getBlockAt(flagBaseX, y, flagBaseZ).type.isAir ) {
                     return Result.failure(ErrorSkyBlocked)
                 }
             }
@@ -530,12 +535,9 @@ public object FlagWar {
         attackingTown: Town,
         chunk: TerritoryChunk,
         flagBase: Block,
-        progress: Long,
-        skyBeaconColorBlocksInput: MutableList<Block>? = null,
-        skyBeaconWireframeBlocksInput: MutableList<Block>? = null
+        progress: Long
     ): Attack {
-
-        val world = flagBase.getWorld()
+        val world = flagBase.world
         val flagBaseX = flagBase.x
         val flagBaseY = flagBase.y
         val flagBaseZ = flagBase.z
@@ -543,9 +545,11 @@ public object FlagWar {
 
         val flagBlock = world.getBlockAt(flagBaseX, flagBaseY + 1, flagBaseZ)
         val flagTorch = world.getBlockAt(flagBaseX, flagBaseY + 2, flagBaseZ)
-        val progressBar = Bukkit.getServer().createBossBar("Attacking ${territory.town!!.name} at (${flagBaseX}, ${flagBaseY}, ${flagBaseZ})", BarColor.YELLOW, BarStyle.SOLID)
-        
-        // calculate max attack time based on chunk
+        val progressBar = Bukkit.getServer().createBossBar(
+            "Attacking ${territory.town?.name ?: "territory"} at ($flagBaseX, $flagBaseZ)",
+             BarColor.YELLOW, 
+             BarStyle.SOLID
+        )
         var attackTime = Config.chunkAttackTime.toDouble()
         if ( territory.bordersWilderness ) {
             attackTime *= Config.chunkAttackFromWastelandMultiplier
@@ -554,40 +558,41 @@ public object FlagWar {
             attackTime *= Config.chunkAttackHomeMultiplier
         }
 
-        // get sky beacon blocks
-        val skyBeaconColorBlocks: MutableList<Block> = if ( skyBeaconColorBlocksInput === null ) {
-            mutableListOf()
-        } else {
-            skyBeaconColorBlocksInput
-        }
-        val skyBeaconWireframeBlocks: MutableList<Block> = if ( skyBeaconWireframeBlocksInput === null ) {
-            mutableListOf()
-        } else {
-            skyBeaconWireframeBlocksInput
+        // Create and configure flag nametag
+        val flagNametagLocation = flagTorch.location.clone().add(0.5, 0.5, 0.5) // Adjusted Y: Torch_Y + 0.5 = Base_Y + 2.5
+        val flagNametag = world.spawn(flagNametagLocation, ArmorStand::class.java).apply {
+            isVisible = false
+            isSmall = true
+            isMarker = true
+            isCustomNameVisible = true
+            
+            // Initial Nametag Format Setup
+            val attackerPlayer = Nodes.getResidentFromUUID(attacker)
+            val attackerName = attackerPlayer?.name ?: "Unknown"
+            val nationName = attackingTown.nation?.name
+            val townName = attackingTown.name
+            val timeRemaining = formatTimeRemaining(max(0, attackTime.toLong() - progress))
+            
+            val prefix = if (nationName != null) {
+                "${ChatColor.GRAY}[${ChatColor.DARK_PURPLE}${nationName}${ChatColor.GRAY}|${ChatColor.GREEN}${townName}${ChatColor.GRAY}]"
+            } else {
+                "${ChatColor.GRAY}[${ChatColor.GREEN}${townName}${ChatColor.GRAY}]"
+            }
+            customName = "${prefix} ${ChatColor.GOLD}${attackerName} ${ChatColor.GRAY}| ${ChatColor.YELLOW}${timeRemaining}"
+            
+            setGravity(false)
         }
 
-        if ( skyBeaconColorBlocksInput === null || skyBeaconWireframeBlocksInput === null ) {
-            FlagWar.createAttackBeacon(
-                skyBeaconColorBlocks,
-                skyBeaconWireframeBlocks,
-                world,
-                chunk.coord,
-                flagBaseY,
-                0,
-                true, // create frame
-                true, // create color
-                true  // lighting update
-            )
+        // Initialize physical flag blocks (using the deepslate setter now)
+        if (flagBlock.type.isAir) {
+             setFlagAttackColorBlock(flagBlock, 0) // Set initial deepslate variant
         }
-        
-        // no flag base block, set to default
-        if ( !Config.flagMaterials.contains(flagBase.type) ) {
+        if (flagTorch.type.isAir) {
+             flagTorch.setType(Material.TORCH)
+        }
+        if (!Config.flagMaterials.contains(flagBase.type)) {
             flagBase.setType(Config.flagMaterialDefault)
         }
-
-        // initialize flag blocks
-        setFlagAttackColorBlock(flagBlock, 0)
-        flagTorch.setType(Material.TORCH)
 
         // create new attack instance
         val attack = Attack(
@@ -597,11 +602,10 @@ public object FlagWar {
             flagBase,
             flagBlock,
             flagTorch,
-            skyBeaconColorBlocks.toList(),
-            skyBeaconWireframeBlocks.toList(),
             progressBar,
             attackTime.toLong(),
-            progress
+            progress,
+            flagNametag
         )
 
         // mark territory chunk under attack
@@ -816,98 +820,160 @@ public object FlagWar {
     }
 
     /**
-     * Create/update a flag attack beacon
-     * Uses an fast editing session with single packet send and
-     * no lighting updates
-     * - with block.setType(): takes ~2 ms to update
-     * - with edit session: takes ~200-300 us to update
+     * Populates the visual beacon block data for an attack.
+     * Does NOT send any packets or change server blocks.
      */
     internal fun createAttackBeacon(
-        skyBeaconColorBlocks: MutableList<Block>,
-        skyBeaconWireframeBlocks: MutableList<Block>,
+        attack: Attack, // Pass the Attack instance
         world: World,
         coord: Coord,
         flagBaseY: Int,
-        progress: Int,
+        progressColorIndex: Int, // Use index directly
         createFrame: Boolean,
         createColor: Boolean,
-        updateLighting: Boolean
+        updateLighting: Boolean // Parameter kept for signature consistency but not used
     ) {
-        // create edit session
-        //val edit = FastBlockEditSession(world)
+        attack.beaconVisualBlocks.clear()
+        attack.originalBlocks.clear()
+
+        // Ensure color index is valid
+        val validProgressColorIndex = max(0, min(FLAG_COLORS.size - 1, progressColorIndex))
+
+        val frameData = SKY_BEACON_FRAME_BLOCK.createBlockData()
+        val colorData = FLAG_COLORS[validProgressColorIndex].createBlockData()
 
         // get starting corner
         val size = FlagWar.skyBeaconSize
-        val startPositionInChunk: Int = (16 - size)/2
+        val startPositionInChunk: Int = (16 - size) / 2
         val x0: Int = coord.x * 16 + startPositionInChunk
         val z0: Int = coord.z * 16 + startPositionInChunk
-        val y0: Int = Math.max(flagBaseY + Config.flagBeaconSkyLevel, Config.flagBeaconMinSkyLevel)
+        val y0: Int = max(flagBaseY + Config.flagBeaconSkyLevel, Config.flagBeaconMinSkyLevel)
         val xEnd: Int = x0 + size - 1
         val zEnd: Int = z0 + size - 1
-        val yEnd: Int = Math.min(255, y0 + size) // truncate at map limit
-        
-        // max color
-        val progressColor = Math.min(progress, FLAG_COLORS.size - 1)
+        val yEnd: Int = min(world.maxHeight - 1, y0 + size - 1) // Use world height, ensure valid range
 
-        for ( y in y0..yEnd ) {
-            for ( x in x0..xEnd ) {
-                for ( z in z0..zEnd ) {
-                    val block = world.getBlockAt(x, y, z)
-                    val mat = block.getType()
-                    if ( mat == Material.AIR || SKY_BEACON_MATERIALS.contains(mat) ) {
-                        if ( (( y == y0 || y == yEnd ) && ( x == x0 || x == xEnd || z == z0 || z == zEnd )) || // end caps, edges glowstone
-                             (( x == x0 || x == xEnd ) && ( z == z0 || z == zEnd )) ) {  // middle section corners glowstone
-                            // block.setType(BEACON_EDGE_BLOCK) // slow
-                            skyBeaconWireframeBlocks.add(block)
-                            if ( createFrame ) {
-                                //edit.setBlock(x, y, z, SKY_BEACON_FRAME_BLOCK)
-                                block.type = SKY_BEACON_FRAME_BLOCK
+        for (y in y0..yEnd) {
+            for (x in x0..xEnd) {
+                for (z in z0..zEnd) {
+                    val loc = Location(world, x.toDouble(), y.toDouble(), z.toDouble())
+                    val currentBlockData: BlockData
+                    try {
+                        // Getting block data can sometimes fail near world borders or unloaded chunks
+                         currentBlockData = world.getBlockData(x, y, z)
+                    } catch (e: Exception) {
+                        Nodes.logger?.warning("[WarBeacon] Failed to get block data at $x, $y, $z: ${e.message}")
+                        continue // Skip this block
+                    }
+                    
+                    // Store original block data *before* deciding beacon type
+                    attack.originalBlocks[loc] = currentBlockData
+
+                    // Only proceed if the block is replaceable (air or existing beacon part)
+                    if (currentBlockData.material == Material.AIR || SKY_BEACON_MATERIALS.contains(currentBlockData.material)) {
+                        if (((y == y0 || y == yEnd) && (x == x0 || x == xEnd || z == z0 || z == zEnd)) || // end caps edges
+                            ((x == x0 || x == xEnd) && (z == z0 || z == zEnd))) { // middle section corners
+                            if (createFrame) {
+                                attack.beaconVisualBlocks[loc] = frameData
+                            }
+                        } else { // color block
+                            if (createColor) {
+                                attack.beaconVisualBlocks[loc] = colorData
                             }
                         }
-                        else { // color block
-                            // setFlagAttackColorBlock(block, progress) // slow
-                            skyBeaconColorBlocks.add(block)
-                            if ( createColor ) {
-                                //edit.setBlock(x, y, z, FLAG_COLORS[progressColor])
-                                block.type = FLAG_COLORS[progressColor]
-                            }
-                        }
+                    } else {
+                        // If the block is not replaceable, remove it from originalBlocks
+                        // so we don't try to revert it later
+                        attack.originalBlocks.remove(loc)
                     }
                 }
             }
         }
+    }
 
-//        if ( createFrame || createColor ) {
-//            edit.update(updateLighting)
-//        }
+    /**
+     * Sends the current state of the beacon visuals to nearby players.
+     */
+    internal fun sendBeaconUpdateToNearbyPlayers(attack: Attack) {
+        sendBlockChangesToNearbyPlayers(attack.flagBase.location, attack.beaconVisualBlocks)
+    }
+
+    /**
+     * Sends the original block states to nearby players to remove the beacon visual.
+     */
+    internal fun removeBeaconVisualsForNearbyPlayers(attack: Attack) {
+        // Send the original blocks back to the clients
+        sendBlockChangesToNearbyPlayers(attack.flagBase.location, attack.originalBlocks)
+        // Clear the maps after sending the removal update
+        attack.beaconVisualBlocks.clear()
+        attack.originalBlocks.clear()
+    }
+    
+    /**
+     * Helper function to send a map of block changes to nearby players.
+     */
+    private fun sendBlockChangesToNearbyPlayers(center: Location, changes: Map<Location, BlockData>) {
+        if (changes.isEmpty()) return // Nothing to send
+
+        val world = center.world ?: return // Safety check
+        
+        // Use a view distance check appropriate for squared distance
+        val nearbyPlayers = world.players.filter { 
+            it.world == world && it.location.distanceSquared(center) < beaconViewDistanceSquared 
+        }
+        
+        // Ensure the map type matches the API (Paper 1.16.5+ wants Map<Location, BlockData>)
+        val blockDataMap: Map<Location, BlockData> = changes
+
+        nearbyPlayers.forEach { player ->
+            try {
+                // Explicitly pass the map with the correct type
+                player.sendMultiBlockChange(blockDataMap, false) // false = do not queue (send immediately)
+            } catch (e: Exception) {
+                 Nodes.logger?.warning("[FlagWar] Failed to send multi-block change packet for player ${player.name}: ${e.message}")
+            }
+        }
     }
 
     /**
      * Update flag colors blocks based on progress color
+     * Now updates the visual map and sends packets.
      */
     internal fun updateAttackFlag(
-        flagBlock: Block,
-        skyBeaconColorBlocks: List<Block>,
-        progressColor: Int
+        attack: Attack,
+        progressColorIndex: Int
     ) {
-        //val world = flagBlock.getWorld()
+        // Ensure color index is valid
+        val validProgressColorIndex = max(0, min(FLAG_COLORS.size - 1, progressColorIndex))
+        val newColorData = FLAG_COLORS[validProgressColorIndex].createBlockData() // Uses new Deepslate FLAG_COLORS
+        val flagLoc = attack.flagBlock.location // Location of the main flag block
 
-        // create edit session
-        //val edit = FastBlockEditSession(world)
+        // Update the central flag block visual ONLY if it's part of the visual map
+        if (attack.beaconVisualBlocks.containsKey(flagLoc)) { 
+             val currentVisualData = attack.beaconVisualBlocks[flagLoc]
+             // Check if current block is one of the Deepslate variants in FLAG_COLORS
+             if (currentVisualData != null && FLAG_COLORS.any { it == currentVisualData.material }) {
+                  attack.beaconVisualBlocks[flagLoc] = newColorData
+             } 
+             // Optional: Force update even if it wasn't a color block?
+             // else { attack.beaconVisualBlocks[flagLoc] = newColorData }
+        } 
+        // Optional: Add if not present?
+        // else { attack.beaconVisualBlocks[flagLoc] = newColorData } 
+       
+        // Update beacon color blocks in the map (excluding the central flag block)
+        val locationsToUpdate = attack.beaconVisualBlocks.filter { (loc, data) -> 
+             loc != flagLoc && 
+             FLAG_COLORS.any { it == data.material } // Update only blocks that are currently a Deepslate color variant
+        }.keys
 
-        flagBlock.type = FLAG_COLORS[progressColor]
-        for ( block in skyBeaconColorBlocks ) {
-            block.type = FLAG_COLORS[progressColor]
+        locationsToUpdate.forEach { loc ->
+            attack.beaconVisualBlocks[loc] = newColorData
         }
 
-        // dont do lighting update
-        //edit.update(false)
+        // Send the updated visuals
+        sendBeaconUpdateToNearbyPlayers(attack)
     }
 
-    // cleanup attack instance, then dispatch signal
-    // that attack cancelled (was defended)
-    // (runs on main thread)
-    // TODO: signal event that chunk defended (broadcast message)
     internal fun cancelAttack(attack: Attack) {
         // remove status from territory chunk
         val chunk = Nodes.getTerritoryChunkFromCoord(attack.coord)
@@ -916,29 +982,27 @@ public object FlagWar {
         // remove progress bar from player
         attack.progressBar.removeAll()
 
-        // remove claim flag
+        // Remove physical flag blocks (these were actually placed)
         attack.flagTorch.setType(Material.AIR)
         attack.flagBlock.setType(Material.AIR)
         attack.flagBase.setType(Material.AIR)
 
-        // remove sky beacon
-        for ( block in attack.skyBeaconWireframeBlocks ) {
-            block.setType(Material.AIR)
-        }
-        for ( block in attack.skyBeaconColorBlocks ) {
-            block.setType(Material.AIR)
-        }
+        // Remove flag nametag
+        attack.flagNametag?.remove()
+
+        // Remove sky beacon VISUALS using packets
+        removeBeaconVisualsForNearbyPlayers(attack)
 
         // remove attack instance references
         FlagWar.attackers.get(attack.attacker)?.remove(attack)
         FlagWar.chunkToAttacker.remove(attack.coord)
         FlagWar.blockToAttacker.remove(attack.flagBlock)
-        
+
         // mark save needed
         FlagWar.needsSave = true
 
         // run cancel attack event
-        if ( chunk !== null ) {
+        if (chunk !== null) {
             val event = WarAttackCancelEvent(
                 attack.attacker,
                 attack.town,
@@ -949,35 +1013,20 @@ public object FlagWar {
         }
     }
 
-    /**
-     * finish attack instance and capture chunk
-     * - calls event which may cancel the capture
-     * - set chunk occupation status
-     * - dispatch signal that attack finished
-     * (runs on main thread)
-     * different results:
-     *   1. attacking enemy chunk -> capture chunk
-     *   2. attacking enemy home chunk -> capture territory
-     *   3. attacking town/ally occupied chunk -> capture chunk
-     *   4. attacking town/ally home chunk -> recapture territory
-     * TODO: signal event that chunk captured (broadcast message)
-     */
     internal fun finishAttack(attack: Attack) {
         // remove progress bar from player
         attack.progressBar.removeAll()
 
-        // remove claim flag
+        // Remove physical flag blocks
         attack.flagTorch.setType(Material.AIR)
         attack.flagBlock.setType(Material.AIR)
         attack.flagBase.setType(Material.AIR)
 
-        // remove sky beacon
-        for ( block in attack.skyBeaconWireframeBlocks ) {
-            block.setType(Material.AIR)
-        }
-        for ( block in attack.skyBeaconColorBlocks ) {
-            block.setType(Material.AIR)
-        }
+        // Remove flag nametag
+        attack.flagNametag?.remove()
+
+        // Remove sky beacon VISUALS using packets
+        removeBeaconVisualsForNearbyPlayers(attack)
 
         // remove attack instance references
         FlagWar.attackers.get(attack.attacker)?.remove(attack)
@@ -986,9 +1035,7 @@ public object FlagWar {
 
         // mark that save required
         FlagWar.needsSave = true
-        
-        // chunk should not be null unless territory swapped
-        // out during attack and chunks were modified in new territory
+
         val chunk = Nodes.getTerritoryChunkFromCoord(attack.coord)
         if ( chunk == null ) {
             Nodes.logger?.severe("finishAttack(): TerritoryChunk at ${attack.coord} is null")
@@ -1104,32 +1151,53 @@ public object FlagWar {
     internal fun attackTick(attack: Attack) {
         val progress = attack.progress + FlagWar.ATTACK_TICK
 
-        if ( progress >= attack.attackTime ) {
-            // cancel thread, then schedule finalization function on main thread
+        if (progress >= attack.attackTime) {
+            // Finish attack logic...
             attack.thread.cancel()
             Bukkit.getGlobalRegionScheduler().run(Nodes.plugin!!) {
                 FlagWar.finishAttack(attack)
             }
-        }
-        else { // update
+        } else { // Update progress
             attack.progress = progress
 
-            // update boss bar progress
+            // Update boss bar progress
             val progressNormalized: Double = progress.toDouble() / attack.attackTime.toDouble()
-            attack.progressBar.setProgress(progressNormalized)
+            attack.progressBar.setProgress(max(0.0, min(1.0, progressNormalized)))
             
-            val progressColor = (progressNormalized * WOOL_COLORS.size.toDouble()).toInt()
-            if ( progressColor != attack.progressColor ) {
-                attack.progressColor = progressColor
-
-                // update attack flag + block beacon indicator
-                // -> must schedule sync task on main thread
+            // Check if color needs update (less frequent)
+            val progressColorIndex = getProgressColor(progressNormalized)
+            if (progressColorIndex != attack.progressColor) {
+                attack.progressColor = progressColorIndex
+                // Schedule color update task
                 Bukkit.getRegionScheduler().run(Nodes.plugin!!, attack.flagBlock.location) {
                     FlagWar.updateAttackFlag(
-                        attack.flagBlock,
-                        attack.skyBeaconColorBlocks,
-                        progressColor
+                        attack,
+                        progressColorIndex
                     )
+                }
+            }
+
+            // Update the nametag every tick (every second)
+            // Schedule this on the region scheduler as well to ensure thread safety when accessing Bukkit API
+            Bukkit.getRegionScheduler().run(Nodes.plugin!!, attack.flagBlock.location) { 
+                try {
+                    val timeRemaining = formatTimeRemaining(max(0L, attack.attackTime - progress))
+                    val attackerPlayer = Nodes.getResidentFromUUID(attack.attacker)
+                    val attackerName = attackerPlayer?.name ?: "Unknown"
+                    // Need the town and nation again for the prefix
+                    val attackingTown = attack.town // Already available in Attack object
+                    val nationName = attackingTown.nation?.name
+                    val townName = attackingTown.name
+                    
+                    val prefix = if (nationName != null) {
+                        "${ChatColor.GRAY}[${ChatColor.DARK_PURPLE}${nationName}${ChatColor.GRAY}|${ChatColor.GREEN}${townName}${ChatColor.GRAY}]"
+                    } else {
+                        "${ChatColor.GRAY}[${ChatColor.GREEN}${townName}${ChatColor.GRAY}]"
+                    }
+                    attack.flagNametag?.customName = "${prefix} ${ChatColor.GOLD}${attackerName} ${ChatColor.GRAY}| ${ChatColor.YELLOW}${timeRemaining}"
+                
+                } catch (e: Exception) {
+                        Nodes.logger?.warning("[WarTick] Failed to update nametag for attack at ${attack.coord}: ${e.message}")
                 }
             }
         }
@@ -1157,9 +1225,79 @@ public object FlagWar {
         if ( progressNormalized < 0.0 ) {
             return 0
         } else if ( progressNormalized > 1.0 ) {
-            return WOOL_COLORS.size - 1
+            return FLAG_COLORS.size - 1
         } else {
-            return (progressNormalized * WOOL_COLORS.size.toDouble()).toInt()
+            return (progressNormalized * FLAG_COLORS.size.toDouble()).toInt()
         }
+    }
+
+    /**
+     * Format time remaining in seconds to a readable format
+     */
+    internal fun formatTimeRemaining(timeInTicks: Long): String {
+        val seconds = timeInTicks / 20 // Convert ticks to seconds
+        
+        if (seconds < 60) {
+            return "${seconds}s"
+        }
+        
+        val minutes = seconds / 60
+        val remainingSeconds = seconds % 60
+        return "${minutes}m ${remainingSeconds}s"
+    }
+
+    // ADDED FUNCTION FOR DYNMAP INTEGRATION
+    fun getActiveWarFlagsForDynmap(): List<DynmapWarFlag> {
+        val activeFlags = mutableListOf<DynmapWarFlag>()
+
+        chunkToAttacker.values.forEach { attack -> // References now internal to FlagWar object
+            try {
+                val attackingTown = attack.town
+                val worldName = attack.flagBase.world.name // Make sure world is loaded
+
+                val timeRemaining = max(0L, attack.attackTime - attack.progress)
+                val progressNormalized = (attack.progress.toDouble() / attack.attackTime.toDouble()).coerceIn(0.0, 1.0)
+                val timeRemainingStr = formatTimeRemaining(timeRemaining) // Uses internal formatTimeRemaining
+
+                activeFlags.add(
+                    DynmapWarFlag(
+                        id = attack.coord.toString().replace(" ", "_"), // Ensure ID is simple string for JSON/JS
+                        x = attack.flagBase.x,
+                        y = attack.flagBase.y,
+                        z = attack.flagBase.z,
+                        world = worldName,
+                        attackerTownName = attackingTown.name,
+                        attackerNationName = attackingTown.nation?.name,
+                        progressNormalized = progressNormalized,
+                        timeRemainingFormatted = timeRemainingStr
+                    )
+                )
+            } catch (e: Exception) {
+                Nodes.logger?.warning("[DynmapWarFlags] Error processing attack at ${attack.coord}: ${e.message}")
+                // Optionally log stack trace e.printStackTrace()
+            }
+        }
+        return activeFlags
+    }
+
+    // Called on plugin enable/reload
+    internal fun loadConfig() {
+        // Load other war config...
+        try {
+             // Check if the field exists in Config - replace with your actual config access
+             if (Config::class.java.getDeclaredField("flagBeaconViewDistance") != null) {
+                 beaconViewDistanceSquared = Config.flagBeaconViewDistance.toDouble().pow(2)
+             } else {
+                  Nodes.logger?.warning("[WarConfig] Config.flagBeaconViewDistance not found, using default: ${BEACON_VIEW_DISTANCE_DEFAULT}")
+                  beaconViewDistanceSquared = BEACON_VIEW_DISTANCE_DEFAULT.pow(2)
+             }
+        } catch (e: NoSuchFieldException) {
+             Nodes.logger?.warning("[WarConfig] Config.flagBeaconViewDistance not found, using default: ${BEACON_VIEW_DISTANCE_DEFAULT}")
+             beaconViewDistanceSquared = BEACON_VIEW_DISTANCE_DEFAULT.pow(2)
+        } catch (e: Exception) {
+            Nodes.logger?.warning("[WarConfig] Error loading flagBeaconViewDistance, using default: ${BEACON_VIEW_DISTANCE_DEFAULT}. Error: ${e.message}")
+            beaconViewDistanceSquared = BEACON_VIEW_DISTANCE_DEFAULT.pow(2)
+        }
+        skyBeaconSize = max(2, min(16, Config.flagBeaconSize)) // Ensure size is valid
     }
 }

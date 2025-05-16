@@ -9,9 +9,11 @@ package phonon.nodes.war
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask
 import java.util.UUID
 import org.bukkit.Bukkit
-import org.bukkit.scheduler.BukkitTask
 import org.bukkit.block.Block
+import org.bukkit.block.data.BlockData
+import org.bukkit.Location
 import org.bukkit.boss.*
+import org.bukkit.entity.ArmorStand
 import phonon.nodes.Nodes
 import phonon.nodes.Config
 import phonon.nodes.objects.Coord
@@ -23,15 +25,19 @@ public class Attack(
     val attacker: UUID,        // attacker's UUID
     val town: Town,            // attacker's town
     val coord: Coord,          // chunk coord under attack
-    val flagBase: Block,       // fence base of flag
-    val flagBlock: Block,      // wool block for flag
-    val flagTorch: Block,      // torch block of flag
-    val skyBeaconColorBlocks: List<Block>,
-    val skyBeaconWireframeBlocks: List<Block>,
+    val flagBase: Block,       // fence base of flag (used for location)
+    val flagBlock: Block,      // wool block for flag (used as key in FlagWar.blockToAttacker)
+    val flagTorch: Block,      // torch block of flag (used for removal)
     val progressBar: BossBar,  // progress bar
     val attackTime: Long,      // 
-    var progress: Long         // initial progress, current tick count
+    var progress: Long,        // initial progress, current tick count
+    val flagNametag: ArmorStand? = null  // nametag displaying info about the flag
 ): Runnable {
+    // Map to store locations and intended BlockData for the visual beacon
+    val beaconVisualBlocks: MutableMap<Location, BlockData> = mutableMapOf()
+    // Map to store the original blocks replaced by the beacon visual
+    val originalBlocks: MutableMap<Location, BlockData> = mutableMapOf()
+
     // no build region
     val noBuildXMin: Int
     val noBuildXMax: Int
@@ -71,10 +77,26 @@ public class Attack(
             this.flagBase
         )
         
+        // Initialize the beacon visuals (populate beaconVisualBlocks and originalBlocks)
+        // This needs to happen *after* flagBase is available
+        FlagWar.createAttackBeacon(
+            this, // Pass the Attack instance itself
+            flagBase.world,
+            coord,
+            flagBase.y,
+            FlagWar.getProgressColor(progressNormalized),
+            true, // createFrame
+            true, // createColor
+            false // updateLighting (not relevant for packet-based visuals)
+        )
+        
         // full json StringBuilder, initialize capacity to be
         // base capacity + room for progress ticks length
         val jsonStringBufferSize = this.jsonStringBase.capacity() + 20
         this.jsonString = StringBuilder(jsonStringBufferSize)
+
+        // Initial send of beacon visual to nearby players
+        FlagWar.sendBeaconUpdateToNearbyPlayers(this)
     }
 
     override public fun run() {
@@ -114,8 +136,8 @@ public class Attack(
 // - attacker: player uuid
 // - coord: chunk coord
 // - block: flag base block (fence)
-// - skyBeaconColorBlocks: track blocks in sky beacon
-// - skyBeaconWireframeBlocks: track blocks in sky beacon
+// - skyBeaconColorBlocks: track blocks in sky beacon -> No longer serialized directly, visual only
+// - skyBeaconWireframeBlocks: track blocks in sky beacon -> No longer serialized directly, visual only
 private fun generateFixedJsonBase(
     attacker: UUID,
     coord: Coord,

@@ -52,7 +52,7 @@ val ICON_OCCUPY = ItemIcon(
 
 // icon for letting other party annex your territory
 val ICON_ANNEX = ItemIcon(
-    ItemStack(Material.GRASS, 1),
+    ItemStack(Material.SHORT_GRASS, 1),
     "${ChatColor.RED}${ChatColor.BOLD}Cede Territory",
     listOf(
         "${ChatColor.WHITE}Other town will annex this territory",
